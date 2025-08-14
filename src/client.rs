@@ -32,11 +32,14 @@ use crate::{
     error::{BitcoinRpcError, ClientError},
     traits::{Broadcaster, Reader, Signer, Wallet},
     types::{
-        CreateRawTransaction, CreateWallet, GetBlockVerbosityOne, GetBlockVerbosityZero,
-        GetBlockchainInfo, GetMempoolInfo, GetNewAddress, GetRawTransactionVerbosityOne,
+        CreateRawTransaction, CreateRawTransactionInput, CreateRawTransactionOutput, CreateWallet,
+        GetAddressInfo, GetBlockVerbosityOne, GetBlockVerbosityZero, GetBlockchainInfo,
+        GetMempoolInfo, GetNewAddress, GetRawTransactionVerbosityOne,
         GetRawTransactionVerbosityZero, GetTransaction, GetTxOut, ImportDescriptor,
         ImportDescriptorResult, ListDescriptors, ListTransactions, ListUnspent,
-        PreviousTransactionOutput, SignRawTransactionWithWallet, SubmitPackage, TestMempoolAccept,
+        ListUnspentQueryOptions, PreviousTransactionOutput, PsbtBumpFee, PsbtBumpFeeOptions,
+        SighashType, SignRawTransactionWithWallet, SubmitPackage, TestMempoolAccept,
+        WalletCreateFundedPsbt, WalletCreateFundedPsbtOptions, WalletProcessPsbtResult,
     },
 };
 
@@ -463,6 +466,59 @@ impl Wallet for Client {
         consensus::encode::deserialize_hex(&raw_tx)
             .map_err(|e| ClientError::Other(format!("Failed to deserialize raw transaction: {e}")))
     }
+
+    async fn wallet_create_funded_psbt(
+        &self,
+        inputs: &[CreateRawTransactionInput],
+        outputs: &[CreateRawTransactionOutput],
+        locktime: Option<u32>,
+        options: Option<WalletCreateFundedPsbtOptions>,
+        bip32_derivs: Option<bool>,
+    ) -> ClientResult<WalletCreateFundedPsbt> {
+        self.call::<WalletCreateFundedPsbt>(
+            "walletcreatefundedpsbt",
+            &[
+                to_value(inputs)?,
+                to_value(outputs)?,
+                to_value(locktime.unwrap_or(0))?,
+                to_value(options.unwrap_or_default())?,
+                to_value(bip32_derivs)?,
+            ],
+        )
+        .await
+    }
+
+    async fn get_address_info(&self, address: &Address) -> ClientResult<GetAddressInfo> {
+        trace!(address = %address, "Getting address info");
+        self.call::<GetAddressInfo>("getaddressinfo", &[to_value(address.to_string())?])
+            .await
+    }
+
+    async fn list_unspent(
+        &self,
+        min_conf: Option<u32>,
+        max_conf: Option<u32>,
+        addresses: Option<&[Address]>,
+        include_unsafe: Option<bool>,
+        query_options: Option<ListUnspentQueryOptions>,
+    ) -> ClientResult<Vec<ListUnspent>> {
+        let addr_strings: Vec<String> = addresses
+            .map(|addrs| addrs.iter().map(|a| a.to_string()).collect())
+            .unwrap_or_default();
+
+        let mut params = vec![
+            to_value(min_conf.unwrap_or(1))?,
+            to_value(max_conf.unwrap_or(9_999_999))?,
+            to_value(addr_strings)?,
+            to_value(include_unsafe.unwrap_or(true))?,
+        ];
+
+        if let Some(query_options) = query_options {
+            params.push(to_value(query_options)?);
+        }
+
+        self.call::<Vec<ListUnspent>>("listunspent", &params).await
+    }
 }
 
 impl Signer for Client {
@@ -540,6 +596,41 @@ impl Signer for Client {
             .await?;
         Ok(result)
     }
+
+    async fn wallet_process_psbt(
+        &self,
+        psbt: &str,
+        sign: Option<bool>,
+        sighashtype: Option<SighashType>,
+        bip32_derivs: Option<bool>,
+    ) -> ClientResult<WalletProcessPsbtResult> {
+        let mut params = vec![to_value(psbt)?, to_value(sign.unwrap_or(true))?];
+
+        if let Some(sighashtype) = sighashtype {
+            params.push(to_value(sighashtype)?);
+        }
+
+        if let Some(bip32_derivs) = bip32_derivs {
+            params.push(to_value(bip32_derivs)?);
+        }
+
+        self.call::<WalletProcessPsbtResult>("walletprocesspsbt", &params)
+            .await
+    }
+
+    async fn psbt_bump_fee(
+        &self,
+        txid: &Txid,
+        options: Option<PsbtBumpFeeOptions>,
+    ) -> ClientResult<PsbtBumpFee> {
+        let mut params = vec![to_value(txid.to_string())?];
+
+        if let Some(options) = options {
+            params.push(to_value(options)?);
+        }
+
+        self.call::<PsbtBumpFee>("psbtbumpfee", &params).await
+    }
 }
 
 #[cfg(test)]
@@ -550,7 +641,7 @@ mod test {
     use bitcoin::{
         consensus::{self, encode::deserialize_hex},
         hashes::Hash,
-        transaction, Amount, NetworkKind,
+        transaction, Amount, FeeRate, NetworkKind,
     };
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -731,6 +822,110 @@ mod test {
             .unwrap();
         let expected = vec![ImportDescriptorResult { success: true }];
         assert_eq!(expected, got);
+
+        let psbt_address = client.get_new_address().await.unwrap();
+        let psbt_outputs = vec![CreateRawTransactionOutput::AddressAmount {
+            address: psbt_address.to_string(),
+            amount: 1.0,
+        }];
+
+        let funded_psbt = client
+            .wallet_create_funded_psbt(&[], &psbt_outputs, None, None, None)
+            .await
+            .unwrap();
+        assert!(!funded_psbt.psbt.inputs.is_empty());
+        assert!(funded_psbt.fee.to_sat() > 0);
+
+        let processed_psbt = client
+            .wallet_process_psbt(&funded_psbt.psbt.to_string(), None, None, None)
+            .await
+            .unwrap();
+        assert!(!processed_psbt.psbt.as_ref().unwrap().inputs.is_empty());
+        assert!(processed_psbt.complete);
+
+        let finalized_psbt = client
+            .wallet_process_psbt(&funded_psbt.psbt.to_string(), Some(true), None, None)
+            .await
+            .unwrap();
+        assert!(finalized_psbt.complete);
+        assert!(finalized_psbt.hex.is_some());
+        let signed_tx = finalized_psbt.hex.as_ref().unwrap();
+        let signed_txid = signed_tx.compute_txid();
+        let got = client
+            .test_mempool_accept(signed_tx)
+            .await
+            .unwrap()
+            .first()
+            .unwrap()
+            .txid;
+        assert_eq!(signed_txid, got);
+
+        let info_address = client.get_new_address().await.unwrap();
+        let address_info = client.get_address_info(&info_address).await.unwrap();
+        assert_eq!(address_info.address, info_address.as_unchecked().clone());
+        assert!(address_info.is_mine.unwrap_or(false));
+        assert!(address_info.solvable.unwrap_or(false));
+
+        let unspent_address = client.get_new_address().await.unwrap();
+        let unspent_txid = client
+            .call::<String>(
+                "sendtoaddress",
+                &[
+                    to_value(unspent_address.to_string()).unwrap(),
+                    to_value(1.0).unwrap(),
+                ],
+            )
+            .await
+            .unwrap();
+        mine_blocks(&bitcoind, 1, None).unwrap();
+
+        let utxos = client
+            .list_unspent(Some(1), Some(9_999_999), None, Some(true), None)
+            .await
+            .unwrap();
+        assert!(!utxos.is_empty());
+
+        let utxos_filtered = client
+            .list_unspent(
+                Some(1),
+                Some(9_999_999),
+                Some(std::slice::from_ref(&unspent_address)),
+                Some(true),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!utxos_filtered.is_empty());
+        let found_utxo = utxos_filtered.iter().any(|utxo| {
+            utxo.txid.to_string() == unspent_txid
+                && utxo.address.clone().assume_checked().to_string() == unspent_address.to_string()
+        });
+        assert!(found_utxo);
+
+        let query_options = ListUnspentQueryOptions {
+            minimum_amount: Some(Amount::from_btc(0.5).unwrap()),
+            maximum_amount: Some(Amount::from_btc(2.0).unwrap()),
+            maximum_count: Some(10),
+        };
+        let utxos_with_query = client
+            .list_unspent(
+                Some(1),
+                Some(9_999_999),
+                None,
+                Some(true),
+                Some(query_options),
+            )
+            .await
+            .unwrap();
+        assert!(!utxos_with_query.is_empty());
+        for utxo in &utxos_with_query {
+            let amount_btc = utxo.amount.to_btc();
+            assert!((0.5..=2.0).contains(&amount_btc));
+        }
+
+        let tx = finalized_psbt.hex.unwrap();
+        assert!(!tx.input.is_empty());
+        assert!(!tx.output.is_empty());
     }
 
     #[tokio::test()]
@@ -996,5 +1191,81 @@ mod test {
             }
             _ => panic!("Expected Status(401, _) error, but got: {error:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn psbt_bump_fee() {
+        init_tracing();
+
+        let (bitcoind, client) = get_bitcoind_and_client();
+
+        // Mine blocks to have funds
+        mine_blocks(&bitcoind, 101, None).unwrap();
+
+        // Send to the next address
+        let destination = client.get_new_address().await.unwrap();
+        let amount = Amount::from_btc(0.001).unwrap(); // 0.001 BTC
+
+        // Create transaction with RBF enabled
+        let txid = bitcoind
+            .client
+            .send_to_address_rbf(&destination, amount)
+            .unwrap()
+            .txid()
+            .unwrap();
+
+        // Verify transaction is in mempool (unconfirmed)
+        let mempool = client.get_raw_mempool().await.unwrap();
+        assert!(
+            mempool.contains(&txid),
+            "Transaction should be in mempool for RBF"
+        );
+
+        // Test psbt_bump_fee with default options
+        let signed_tx = client
+            .psbt_bump_fee(&txid, None)
+            .await
+            .unwrap()
+            .psbt
+            .extract_tx()
+            .unwrap();
+        let signed_txid = signed_tx.compute_txid();
+        let got = client
+            .test_mempool_accept(&signed_tx)
+            .await
+            .unwrap()
+            .first()
+            .unwrap()
+            .txid;
+        assert_eq!(
+            got, signed_txid,
+            "Bumped transaction should be accepted in mempool"
+        );
+
+        // Test psbt_bump_fee with custom fee rate
+        let options = PsbtBumpFeeOptions {
+            fee_rate: Some(FeeRate::from_sat_per_kwu(20)), // 20 sat/vB - higher than default
+            ..Default::default()
+        };
+        trace!(?options, "Calling psbt_bump_fee");
+        let signed_tx = client
+            .psbt_bump_fee(&txid, Some(options))
+            .await
+            .unwrap()
+            .psbt
+            .extract_tx()
+            .unwrap();
+        let signed_txid = signed_tx.compute_txid();
+        let got = client
+            .test_mempool_accept(&signed_tx)
+            .await
+            .unwrap()
+            .first()
+            .unwrap()
+            .txid;
+        assert_eq!(
+            got, signed_txid,
+            "Bumped transaction should be accepted in mempool"
+        );
     }
 }
