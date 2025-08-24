@@ -1,6 +1,9 @@
 use std::{
     env::var,
     fmt,
+    fs::File,
+    io::{BufRead, BufReader},
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -61,6 +64,36 @@ where
         .map_err(|e| ClientError::Param(format!("Error creating value: {e}")))
 }
 
+/// The different authentication methods for the client.
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Auth {
+    None,
+    UserPass(String, String),
+    CookieFile(PathBuf),
+}
+
+impl Auth {
+    pub(crate) fn get_user_pass(self) -> ClientResult<(Option<String>, Option<String>)> {
+        match self {
+            Auth::None => Ok((None, None)),
+            Auth::UserPass(u, p) => Ok((Some(u), Some(p))),
+            Auth::CookieFile(path) => {
+                let line = BufReader::new(
+                    File::open(path).map_err(|e| ClientError::Other(e.to_string()))?,
+                )
+                .lines()
+                .next()
+                .ok_or(ClientError::Other("Invalid cookie file".to_string()))?
+                .map_err(|e| ClientError::Other(e.to_string()))?;
+                let colon = line
+                    .find(':')
+                    .ok_or(ClientError::Other("Invalid cookie file".to_string()))?;
+                Ok((Some(line[..colon].into()), Some(line[colon + 1..].into())))
+            }
+        }
+    }
+}
+
 /// An `async` client for interacting with a `bitcoind` instance.
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -96,25 +129,23 @@ impl Client {
     /// Creates a new [`Client`] with the given URL, username, and password.
     pub fn new(
         url: String,
-        username: String,
-        password: String,
+        auth: Auth,
         max_retries: Option<u8>,
         retry_interval: Option<u64>,
     ) -> ClientResult<Self> {
-        if username.is_empty() || password.is_empty() {
-            return Err(ClientError::MissingUserPassword);
-        }
-
-        let user_pw = general_purpose::STANDARD.encode(format!("{username}:{password}"));
-        let authorization = format!("Basic {user_pw}")
-            .parse()
-            .map_err(|_| ClientError::Other("Error parsing header".to_string()))?;
-
         let content_type = "application/json"
             .parse()
             .map_err(|_| ClientError::Other("Error parsing header".to_string()))?;
-        let headers =
-            HeaderMap::from_iter([(AUTHORIZATION, authorization), (CONTENT_TYPE, content_type)]);
+        let mut headers = HeaderMap::from_iter([(CONTENT_TYPE, content_type)]);
+
+        let (username, password) = auth.get_user_pass()?;
+        if let (Some(username), Some(password)) = (username, password) {
+            let user_pw = general_purpose::STANDARD.encode(format!("{username}:{password}"));
+            let authorization = format!("Basic {user_pw}")
+                .parse()
+                .map_err(|_| ClientError::Other("Error parsing header".to_string()))?;
+            headers.insert(AUTHORIZATION, authorization);
+        }
 
         trace!(headers = ?headers);
 
@@ -1180,15 +1211,8 @@ mod test {
         let (bitcoind, _) = get_bitcoind_and_client();
         let url = bitcoind.rpc_url();
 
-        // Create client with invalid credentials
-        let invalid_client = Client::new(
-            url,
-            "wrong_user".to_string(),
-            "wrong_password".to_string(),
-            None,
-            None,
-        )
-        .unwrap();
+        let auth = Auth::UserPass("wrong_user".to_string(), "wrong_password".to_string());
+        let invalid_client = Client::new(url, auth, None, None).unwrap();
 
         // Try to make any RPC call
         let result = invalid_client.get_blockchain_info().await;
